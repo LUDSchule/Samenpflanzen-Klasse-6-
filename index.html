@@ -82,13 +82,27 @@
     var roh = new Uint8Array(await antwort.arrayBuffer());
 
     var kennung = String.fromCharCode(roh[0], roh[1], roh[2], roh[3]);
-    if (kennung !== 'BIO1') throw new Error('Unbekanntes Dateiformat.');
+    if (kennung !== 'BIO2') throw new Error('Unbekanntes Dateiformat.');
     var sicht = new DataView(roh.buffer);
     var runden = sicht.getInt32(4, true);
     var salz = roh.slice(8, 24);
     var iv = roh.slice(24, 40);
     var pruefsumme = roh.slice(40, 72);
-    var geheim = roh.slice(72);
+    var linkRunden = sicht.getInt32(72, true);
+    var linkSalz = roh.slice(76, 92);
+    var linkIv = roh.slice(92, 108);
+    var verpackterSchluessel = roh.slice(108, 188);
+    var geheim = roh.slice(188);
+
+    // Kommt der Schlüssel aus dem Link, wird damit zuerst das eigentliche
+    // Schlüsselmaterial ausgepackt.
+    if (fertigerSchluessel) {
+      var linkBasis = await crypto.subtle.importKey('raw', fertigerSchluessel, 'PBKDF2', false, ['deriveBits']);
+      var linkMaterial = await crypto.subtle.deriveBits(
+        { name: 'PBKDF2', salt: linkSalz, iterations: linkRunden, hash: 'SHA-256' }, linkBasis, 256);
+      var linkAes = await crypto.subtle.importKey('raw', linkMaterial, { name: 'AES-CBC' }, false, ['decrypt']);
+      fertigerSchluessel = new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-CBC', iv: linkIv }, linkAes, verpackterSchluessel));
+    }
 
     var material;
     if (fertigerSchluessel) {
@@ -138,8 +152,9 @@
 
     var seite = new DOMParser().parseFromString(pfadeErsetzen(text(dateien['index.html'])), 'text/html');
 
+    // Auch im Stylesheet stehen Bildpfade (zum Beispiel die Kreise des Blütendiagramms).
     var stil = document.createElement('style');
-    stil.textContent = text(dateien['stil.css']);
+    stil.textContent = pfadeErsetzen(text(dateien['stil.css']));
     document.head.appendChild(stil);
 
     document.title = seite.title || document.title;
@@ -189,7 +204,7 @@
       sage('Wird geöffnet, einen Moment …', 'laeuft');
       try {
         var schluessel = ausBase64url(ausLink[1]);
-        if (schluessel.length !== 64) throw new Error('Der Link ist unvollständig.');
+        if (schluessel.length !== 16) throw new Error('Der Link ist unvollständig.');
         einbauen(await oeffnen(null, schluessel));
       } catch (fehler) {
         knopf.disabled = false;
