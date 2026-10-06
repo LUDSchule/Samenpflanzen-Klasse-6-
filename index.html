@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Biologie 6C</title>
+<style>
+  :root { --gruen: #2f5e2f; --tinte: #1f1f1f; --grau: #6b6b6b; --rand: #cdd3cb; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, "Segoe UI", Calibri, sans-serif; font-size: 19px; color: var(--tinte); background: #fff; }
+  #schloss { max-width: 460px; margin: 0 auto; padding: 60px 16px; }
+  h1 { font-size: 28px; color: var(--gruen); margin-bottom: 4px; }
+  p.unter { color: var(--grau); margin-top: 0; }
+  label { display: block; margin: 24px 0 6px; font-weight: bold; }
+  input {
+    font: inherit; width: 100%; padding: 12px 14px;
+    border: 2px solid var(--rand); border-radius: 10px;
+  }
+  button {
+    font: inherit; font-size: 18px; margin-top: 14px; padding: 12px 20px;
+    border: 2px solid var(--gruen); border-radius: 10px;
+    background: var(--gruen); color: #fff; cursor: pointer;
+  }
+  button[disabled] { opacity: .6; cursor: default; }
+  label.zeigen { display: flex; align-items: center; gap: 8px; margin: 12px 0 0; font-weight: normal; color: var(--grau); }
+  label.zeigen input { width: 20px; height: 20px; }
+  #meldung { margin-top: 14px; min-height: 26px; font-weight: bold; }
+  #meldung.fehler { color: #a8321f; }
+  #meldung.laeuft { color: var(--grau); font-weight: normal; }
+  main { max-width: 900px; margin: 0 auto; padding: 16px 16px 80px; }
+</style>
+</head>
+<body>
+
+<div id="schloss">
+  <h1>Samenpflanzen</h1>
+  <p class="unter">Vier Stationen · Biologie 6C</p>
+  <form id="formular">
+    <label for="pw">Passwort</label>
+    <input id="pw" type="password" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">
+    <label class="zeigen"><input id="zeigen" type="checkbox"> Passwort anzeigen</label>
+    <button id="knopf" type="submit">Öffnen</button>
+  </form>
+  <p id="meldung"></p>
+</div>
+
+<main id="inhalt" hidden></main>
+
+<script>
+(function () {
+  'use strict';
+
+  var formular = document.getElementById('formular');
+  var meldung = document.getElementById('meldung');
+  var knopf = document.getElementById('knopf');
+
+  function sage(text, art) {
+    meldung.textContent = text;
+    meldung.className = art || '';
+  }
+
+  function gleich(a, b) {
+    if (a.length !== b.length) return false;
+    var unterschied = 0;
+    for (var i = 0; i < a.length; i++) unterschied |= a[i] ^ b[i];
+    return unterschied === 0;
+  }
+
+  function ausBase64url(text) {
+    var normal = text.replace(/-/g, '+').replace(/_/g, '/');
+    while (normal.length % 4) normal += '=';
+    var roh = atob(normal);
+    var bytes = new Uint8Array(roh.length);
+    for (var i = 0; i < roh.length; i++) bytes[i] = roh.charCodeAt(i);
+    return bytes;
+  }
+
+  // schluesselMaterial: entweder aus dem Passwort abgeleitet oder fertig aus dem Link
+  async function oeffnen(passwort, fertigerSchluessel) {
+    var antwort = await fetch('inhalt.bin', { cache: 'no-store' });
+    if (!antwort.ok) throw new Error('Die Datei inhalt.bin wurde nicht gefunden.');
+    var roh = new Uint8Array(await antwort.arrayBuffer());
+
+    var kennung = String.fromCharCode(roh[0], roh[1], roh[2], roh[3]);
+    if (kennung !== 'BIO1') throw new Error('Unbekanntes Dateiformat.');
+    var sicht = new DataView(roh.buffer);
+    var runden = sicht.getInt32(4, true);
+    var salz = roh.slice(8, 24);
+    var iv = roh.slice(24, 40);
+    var pruefsumme = roh.slice(40, 72);
+    var geheim = roh.slice(72);
+
+    var material;
+    if (fertigerSchluessel) {
+      material = fertigerSchluessel;
+    } else {
+      var grundschluessel = await crypto.subtle.importKey('raw', new TextEncoder().encode(passwort), 'PBKDF2', false, ['deriveBits']);
+      material = new Uint8Array(await crypto.subtle.deriveBits(
+        { name: 'PBKDF2', salt: salz, iterations: runden, hash: 'SHA-256' }, grundschluessel, 512));
+    }
+
+    var macSchluessel = await crypto.subtle.importKey('raw', material.slice(32, 64), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+    // Signiert wird: Salz (16 Byte) + IV (16 Byte) + der verschlüsselte Teil
+    var signiert = new Uint8Array(32 + geheim.length);
+    signiert.set(salz, 0); signiert.set(iv, 16); signiert.set(geheim, 32);
+    var eigene = new Uint8Array(await crypto.subtle.sign('HMAC', macSchluessel, signiert));
+    if (!gleich(eigene, pruefsumme)) throw new Error('falsches Passwort');
+
+    var aesSchluessel = await crypto.subtle.importKey('raw', material.slice(0, 32), { name: 'AES-CBC' }, false, ['decrypt']);
+    var klartext = new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-CBC', iv: iv }, aesSchluessel, geheim));
+
+    var laenge = new DataView(klartext.buffer).getInt32(0, true);
+    var verzeichnis = JSON.parse(new TextDecoder().decode(klartext.slice(4, 4 + laenge)));
+    var stelle = 4 + laenge;
+    var dateien = {};
+    verzeichnis.forEach(function (eintrag) {
+      dateien[eintrag.name] = { typ: eintrag.typ, daten: klartext.slice(stelle, stelle + eintrag.lang) };
+      stelle += eintrag.lang;
+    });
+    return dateien;
+  }
+
+  function text(datei) { return new TextDecoder().decode(datei.daten); }
+
+  function einbauen(dateien) {
+    // Bilder als blob: bereitstellen und die Pfade im HTML und im Skript ersetzen
+    var ersatz = {};
+    Object.keys(dateien).forEach(function (name) {
+      if (name.indexOf('bilder/') === 0) {
+        ersatz[name] = URL.createObjectURL(new Blob([dateien[name].daten], { type: dateien[name].typ }));
+      }
+    });
+    function pfadeErsetzen(quelle) {
+      return quelle.replace(/bilder\/[^"'()\s]+?\.(?:jpg|png)/g, function (treffer) {
+        return ersatz[treffer] || treffer;
+      });
+    }
+
+    var seite = new DOMParser().parseFromString(pfadeErsetzen(text(dateien['index.html'])), 'text/html');
+
+    var stil = document.createElement('style');
+    stil.textContent = text(dateien['stil.css']);
+    document.head.appendChild(stil);
+
+    document.title = seite.title || document.title;
+
+    var ziel = document.getElementById('inhalt');
+    ziel.innerHTML = seite.querySelector('main').innerHTML;
+    ziel.hidden = false;
+    document.getElementById('schloss').remove();
+
+    var skript = document.createElement('script');
+    skript.textContent = pfadeErsetzen(text(dateien['app.js']));
+    document.body.appendChild(skript);
+  }
+
+  document.getElementById('zeigen').addEventListener('change', function (e) {
+    document.getElementById('pw').type = e.target.checked ? 'text' : 'password';
+  });
+
+  formular.addEventListener('submit', async function (e) {
+    e.preventDefault();
+    var passwort = document.getElementById('pw').value;
+    if (!passwort) { sage('Bitte das Passwort eingeben.', 'fehler'); return; }
+    knopf.disabled = true;
+    sage('Wird geöffnet, einen Moment …', 'laeuft');
+    try {
+      var dateien = await oeffnen(passwort);
+      try { sessionStorage.setItem('bio6c', passwort); } catch (e2) { /* ohne Speicher auch gut */ }
+      einbauen(dateien);
+    } catch (fehler) {
+      knopf.disabled = false;
+      if (String(fehler.message).indexOf('Passwort') >= 0 || fehler.name === 'OperationError') {
+        sage('Das Passwort stimmt nicht.', 'fehler');
+      } else {
+        sage('Es hat nicht geklappt: ' + fehler.message, 'fehler');
+      }
+    }
+  });
+
+  // Schlüssel aus dem Link (QR-Code): .../index.html#k=...
+  // Im Link steht nicht das Passwort, sondern der daraus abgeleitete Schlüssel.
+  // Der Teil hinter der Raute wird nie an den Server geschickt.
+  var ausLink = /^#k=([A-Za-z0-9_\-]+)$/.exec(location.hash || '');
+  if (ausLink) {
+    history.replaceState(null, '', location.pathname + location.search + '#start');
+    (async function () {
+      knopf.disabled = true;
+      sage('Wird geöffnet, einen Moment …', 'laeuft');
+      try {
+        var schluessel = ausBase64url(ausLink[1]);
+        if (schluessel.length !== 64) throw new Error('Der Link ist unvollständig.');
+        einbauen(await oeffnen(null, schluessel));
+      } catch (fehler) {
+        knopf.disabled = false;
+        sage('Der Link passt nicht zu dieser Seite. Bitte das Passwort eingeben.', 'fehler');
+      }
+    })();
+  } else {
+    // Nach dem Neuladen nicht noch einmal fragen
+    try {
+      var gemerkt = sessionStorage.getItem('bio6c');
+      if (gemerkt) {
+        document.getElementById('pw').value = gemerkt;
+        formular.dispatchEvent(new Event('submit', { cancelable: true }));
+      }
+    } catch (e) { /* egal */ }
+  }
+})();
+</script>
+</body>
+</html>
